@@ -17,6 +17,9 @@ search_all_vbs = False
 kv_nodes = []
 vb_map = {}
 
+def log(**obj):
+    print(json.dumps(obj))
+
 def disconnect():
     for client in kv_nodes:
         client.close()
@@ -27,7 +30,7 @@ def connect_client(host, port):
     client.req_features = {memcacheConstants.FEATURE_SELECT_BUCKET,
                            memcacheConstants.FEATURE_JSON,
                            memcacheConstants.FEATURE_COLLECTIONS}
-    client.hello('manage-cid-prefix-keys')
+    client.hello('find-doc')
     client.sasl_auth_plain(username, password)
     client.bucket_select(bucket_name)
     return client
@@ -69,6 +72,20 @@ def get_doc(id: str, collection: str):
             pass
     return docs
 
+def add_doc(id: str, collection: str, value, flags, vbid=None):
+    if vbid is None:
+        vbid = get_vbid(id)
+    client: mc_bin_client.MemcachedClient = vb_map[vbid]
+    client.vbucketId = vbid
+    client.add(id, exp=0, flags=flags, val=value, collection=collection)
+
+def delete_doc(id: str, collection: str, cas, vbid=None):
+    if vbid is None:
+        vbid = get_vbid(id)
+    client: mc_bin_client.MemcachedClient = vb_map[vbid]
+    client.vbucketId = vbid
+    client.delete(id, cas=cas, collection=collection)
+
 def check_port(s):
     v = int(s)
     if v <= 0 or v >= 0x10000:
@@ -79,15 +96,18 @@ def parse_args():
     parser = ArgumentParser(allow_abbrev=False)
     parser.add_argument('-b', '--bucket', default=bucket_name)
     parser.add_argument('-u', '--username', default=username)
-    parser.add_argument('-p', '--password', default=password)
+    parser.add_argument('-p', '--password', default=password, help='"" for password prompt')
     parser.add_argument('--port', default=kv_node_port, type=check_port, help='KV node port (11210 or 11207 for TLS)')
     parser.add_argument('--host', default=kv_node_host, help='KV node hostname')
     parser.add_argument('--tls', default=kv_node_ssl, action='store_true')
+    parser.add_argument('--restore', action='store_true', help='Copy found docs to the correct vbucket')
+    parser.add_argument('--delete', action='store_true', help='Delete found docs')
     parser.add_argument('--id', metavar='DOC_ID', action='append', help='Single doc id (can be used multiple times)')
     parser.add_argument('--ids-file', metavar='FILE', dest='ids_file', help='JSON file with a list of doc ids')
     parser.add_argument('--collection', metavar='COLLECTION', default='_default._default', help='Scope/Collection')
     parser.add_argument('--value', action='store_true', help='Print doc value')
     parser.add_argument('--search-all-vbs', dest='search_all_vbs', action='store_true', help='Search all vbuckets')
+    parser.add_argument('--add-to-vb', metavar='VB', dest='add_to_vb', type=int)
     return parser.parse_args()
 
 def main():
@@ -100,6 +120,9 @@ def main():
     kv_node_port = options.port
     kv_node_ssl = options.tls
     search_all_vbs = options.search_all_vbs
+    if len(password) == 0:
+        import getpass
+        password = getpass.getpass()
     connect_cluster()
     print()
     if options.id:
@@ -113,22 +136,43 @@ def main():
     else:
         print('Either --id or --ids-file must be specified')
         sys.exit(1)
+    if options.add_to_vb is not None:
+        for id in doc_ids:
+            try:
+                add_doc(id, options.collection, b'{}', 0, options.add_to_vb)
+                log(action='add', added=True, id=id, vb=options.add_to_vb)
+            except mc_bin_client.ErrorKeyEexists:
+                log(action='add', added=False, id=id, reason='exists')
+        disconnect()
+        return
     found_count = 0
     not_found_count = 0
     for id in doc_ids:
         assert isinstance(id, str)
-        escaped_id = json.dumps(id)
         docs = get_doc(id, options.collection)
         if len(docs) == 0:
-            print('Not found', escaped_id)
+            log(action='get', found=False, id=id)
             not_found_count += 1
             continue
         found_count += len(docs)
+        restored_one = False
         for (doc, cas, flags, vbid) in docs:
             if options.value:
-                print('id:', escaped_id, 'cas:', cas, 'flags:', flags, 'vb:', vbid, 'value:', doc)
+                log(action='get', found=True, id=id, cas=cas, flags=flags, vb=vbid, value=doc)
             else:
-                print('id:', escaped_id, 'cas:', cas, 'flags:', flags, 'vb:', vbid)
+                log(action='get', found=True, id=id, cas=cas, flags=flags, vb=vbid)
+            if vbid == get_vbid(id):
+                continue
+            if options.restore and not restored_one:
+                try:
+                    add_doc(id, options.collection, doc, flags)
+                    log(action='add', added=True, id=id)
+                    restored_one = True
+                except mc_bin_client.ErrorKeyEexists:
+                    log(action='add', added=False, id=id, reason='exists')
+            if options.delete:
+                delete_doc(id, options.collection, cas, vbid)
+                log(action='delete', id=id, vb=vbid)
     print('\n------------------------------------------')
     print('Found', found_count)
     print('Not found', not_found_count)
